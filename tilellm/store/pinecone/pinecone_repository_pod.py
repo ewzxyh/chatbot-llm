@@ -1,13 +1,14 @@
 from tilellm.models.item_model import (MetadataItem,
                                        PineconeIndexingResult
                                        )
+from tilellm.shared.utility import inject_embedding
 from tilellm.tools.document_tool_simple import (get_content_by_url,
                                                 get_content_by_url_with_bs,
                                                 load_document,
                                                 load_from_wikipedia
                                                 )
 
-from tilellm.store.pinecone_repository_base import PineconeRepositoryBase
+from tilellm.store.pinecone.pinecone_repository_base import PineconeRepositoryBase
 
 from tilellm.shared import const
 from langchain_core.documents import Document
@@ -21,12 +22,15 @@ logger = logging.getLogger(__name__)
 
 
 class PineconeRepositoryPod(PineconeRepositoryBase):
-    async def add_pc_item(self, item):
+    @inject_embedding()
+    async def add_pc_item(self, item, embedding_obj=None, embedding_dimension=None) -> PineconeIndexingResult:
         """
             Add items to name
             space into Pinecone index
             :param item:
-            :return:
+            :param embedding_obj:
+            :param embedding_dimension:
+            :return: PineconeIndexingResult
             """
         logger.info(item)
         metadata_id = item.id
@@ -45,10 +49,10 @@ class PineconeRepositoryPod(PineconeRepositoryBase):
             logger.warning(ex)
             pass
 
-        emb_dimension = self.get_embeddings_dimension(embedding)
+        emb_dimension = embedding_dimension # self.get_embeddings_dimension(embedding)
 
         # default text-embedding-ada-002 1536, text-embedding-3-large 3072, text-embedding-3-small 1536
-        oai_embeddings = OpenAIEmbeddings(api_key=gpt_key, model=embedding)
+        oai_embeddings = embedding_obj # OpenAIEmbeddings(api_key=gpt_key, model=embedding)
         vector_store = await self.create_pc_index(embeddings=oai_embeddings, emb_dimension=emb_dimension)
 
         chunks = []

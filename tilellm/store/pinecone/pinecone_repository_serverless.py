@@ -7,7 +7,8 @@ from tilellm.tools.document_tool_simple import (get_content_by_url,
                                                 load_from_wikipedia
                                                 )
 
-from tilellm.store.pinecone_repository_base import PineconeRepositoryBase
+from tilellm.store.pinecone.pinecone_repository_base import PineconeRepositoryBase
+from tilellm.shared.utility import inject_embedding
 
 from tilellm.shared import const
 from langchain_core.documents import Document
@@ -22,11 +23,14 @@ logger = logging.getLogger(__name__)
 
 
 class PineconeRepositoryServerless(PineconeRepositoryBase):
-    async def add_pc_item(self, item):
+    @inject_embedding()
+    async def add_pc_item(self, item, embedding_obj=None, embedding_dimension=None):
         """
             Add items to name
             space into Pinecone index
             :param item:
+            :param embedding_obj:
+            :param embedding_dimension:
             :return:
             """
         logger.info(item)
@@ -35,7 +39,7 @@ class PineconeRepositoryServerless(PineconeRepositoryBase):
         source = item.source
         type_source = item.type
         content = item.content
-        gpt_key = item.gptkey
+        #gpt_key = item.gptkey
         embedding = item.embedding
         namespace = item.namespace
         scrape_type = item.scrape_type
@@ -47,12 +51,16 @@ class PineconeRepositoryServerless(PineconeRepositoryBase):
             logger.warning(ex)
             pass
 
-        emb_dimension = self.get_embeddings_dimension(embedding)
+        emb_dimension = embedding_dimension # self.get_embeddings_dimension(embedding)
 
         # default text-embedding-ada-002 1536, text-embedding-3-large 3072, text-embedding-3-small 1536
-        oai_embeddings = OpenAIEmbeddings(api_key=gpt_key, model=embedding)
+        oai_embeddings = embedding_obj # OpenAIEmbeddings(api_key=gpt_key, model=embedding)
         vector_store = await self.create_pc_index(embeddings=oai_embeddings, emb_dimension=emb_dimension)
-
+        # textprova ="test degli embeddings di voyage"
+        # query_result = oai_embeddings.embed_query(textprova)
+        # print(f"len: {len(query_result)}")
+        # print(query_result)
+        # raise Exception
         chunks = []
         total_tokens = 0
         cost = 0
@@ -139,6 +147,8 @@ class PineconeRepositoryServerless(PineconeRepositoryBase):
             pinecone_result = PineconeIndexingResult(id=metadata_id, chunks=len(chunks), total_tokens=total_tokens,
                                                      cost=f"{cost:.6f}")
         except Exception as ex:
+            import traceback
+            traceback.print_exc()
             logger.error(repr(ex))
             pinecone_result = PineconeIndexingResult(id=metadata_id, chunks=len(chunks), total_tokens=total_tokens,
                                                      status=400,
