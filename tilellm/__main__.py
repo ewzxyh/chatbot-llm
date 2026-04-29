@@ -668,6 +668,7 @@ async def post_ask_with_memory_main(question_answer: QuestionAnswer):
             embedding_model, _ = await create_embedding_instance(question_answer)
             query_text = question_answer.retrieval_query or question_answer.question
             query_embedding = await embedding_model.aembed_query(query_text)
+            question_answer.precomputed_query_embedding = query_embedding
             cached = await SemanticCache.lookup(
                 namespace=question_answer.namespace,
                 question=question_answer.question,

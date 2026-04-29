@@ -8,8 +8,11 @@ Reference: https://www.anthropic.com/news/contextual-retrieval
 """
 import asyncio
 import logging
+import os
+import yaml
 from dataclasses import dataclass, field
-from typing import List, Optional, TYPE_CHECKING
+from typing import List, Optional, TYPE_CHECKING, Dict, Any
+from pathlib import Path
 
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage
@@ -18,6 +21,33 @@ if TYPE_CHECKING:
     from tilellm.models.llm import SituatedContextConfig
 
 logger = logging.getLogger(__name__)
+
+# Cache for loaded profiles to avoid repeated disk I/O
+_PROFILES_CACHE: Dict[str, str] = {}
+_PROFILES_DIR = Path(__file__).parent / "profiles" / "situated_context"
+
+
+def _load_profile_prompt(profile_name: str) -> Optional[str]:
+    """Load prompt from a YAML profile file."""
+    if profile_name in _PROFILES_CACHE:
+        return _PROFILES_CACHE[profile_name]
+
+    profile_path = _PROFILES_DIR / f"{profile_name}.yaml"
+    if not profile_path.exists():
+        logger.warning(f"Situated context profile '{profile_name}' not found at {profile_path}")
+        return None
+
+    try:
+        with open(profile_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+            prompt = data.get("prompt")
+            if prompt:
+                _PROFILES_CACHE[profile_name] = prompt
+                return prompt
+    except Exception as e:
+        logger.error(f"Error loading situated context profile '{profile_name}': {e}")
+    
+    return None
 
 
 @dataclass
@@ -82,6 +112,8 @@ async def _generate_situated_context(
     chunk_text: str,
     llm,
     chunk_metadata: Optional[dict] = None,
+    custom_prompt: Optional[str] = None,
+    profile: Optional[str] = None,
 ) -> tuple[str, dict]:
     """Call LLM to generate a situating sentence for one chunk.
 
@@ -89,33 +121,67 @@ async def _generate_situated_context(
         (context_text, token_usage) where token_usage has input_tokens/output_tokens/total_tokens.
     """
     element_type = chunk_metadata.get("element_type") if chunk_metadata else None
-    col_names = (chunk_metadata.get("col_names", "") if chunk_metadata else "") or ""
+    if not element_type and chunk_metadata:
+         # Fallback to 'type' field which is often used as a synonym for element_type
+         element_type = chunk_metadata.get("type")
+
+    # Robust col_names extraction (handles both 'col_names' and 'columns' list)
+    col_names = ""
+    if chunk_metadata:
+        col_names = chunk_metadata.get("col_names", "")
+        if not col_names and "columns" in chunk_metadata:
+            cols = chunk_metadata["columns"]
+            if isinstance(cols, list):
+                col_names = ", ".join(cols)
+            elif isinstance(cols, str):
+                col_names = cols
+    
     source = (chunk_metadata.get("source", "") if chunk_metadata else "") or ""
 
-    if element_type == "table_rows":
-        # Per-row chunks: generate a row-specific description so that each row gets
-        # a unique embedding that captures its actual cell values (e.g. "Product Alpha,
-        # SKU A001, price €9.99").  A generic table-level description would be
-        # identical for all rows and collapse their embeddings → bad retrieval.
-        table_doc_context = source or doc_context
-        prompt = _SITUATED_CONTEXT_TABLE_ROW_PROMPT.format(
-            doc_context=table_doc_context,
-            col_names=col_names,
-            chunk_text=chunk_text[:1200],
-        )
-    elif element_type == "table":
-        # Atomic/adaptive table: describe what the table represents as a whole.
-        table_doc_context = source or doc_context
-        prompt = _SITUATED_CONTEXT_TABLE_PROMPT.format(
-            doc_context=table_doc_context,
-            col_names=col_names,
-            chunk_text=chunk_text[:1200],
-        )
-    else:
-        prompt = _SITUATED_CONTEXT_PROMPT.format(
-            doc_context=doc_context,
-            chunk_text=chunk_text[:1200],
-        )
+    # Priority 1: custom_prompt (per-request override)
+    # Priority 2: profile (loaded from YAML)
+    # Priority 3: standard table/row prompts
+    # Priority 4: standard generic prompt
+
+    base_prompt = custom_prompt
+    if not base_prompt and profile:
+        base_prompt = _load_profile_prompt(profile)
+
+    if base_prompt:
+        try:
+            # Use .format_map to allow partial/extra keys if the prompt is complex
+            prompt = base_prompt.format(
+                doc_context=doc_context,
+                chunk_text=chunk_text[:1200],
+                col_names=col_names,
+                source=source,
+                element_type=element_type or "text"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to format custom/profile situated context prompt: {e}. Falling back to default.")
+            base_prompt = None
+
+    if not base_prompt:
+        if element_type == "table_rows":
+            table_doc_context = source or doc_context
+            prompt = _SITUATED_CONTEXT_TABLE_ROW_PROMPT.format(
+                doc_context=table_doc_context,
+                col_names=col_names,
+                chunk_text=chunk_text[:1200],
+            )
+        elif element_type == "table":
+            table_doc_context = source or doc_context
+            prompt = _SITUATED_CONTEXT_TABLE_PROMPT.format(
+                doc_context=table_doc_context,
+                col_names=col_names,
+                chunk_text=chunk_text[:1200],
+            )
+        else:
+            prompt = _SITUATED_CONTEXT_PROMPT.format(
+                doc_context=doc_context,
+                chunk_text=chunk_text[:1200],
+            )
+
     _empty_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     try:
         response = await llm.ainvoke([HumanMessage(content=prompt)])
@@ -134,7 +200,9 @@ async def enrich_chunks_with_situated_context(
     documents: List[Document],
     llm,
     doc_context: Optional[str] = None,
-    max_concurrent: int = 5
+    max_concurrent: int = 5,
+    custom_prompt: Optional[str] = None,
+    profile: Optional[str] = None,
 ) -> "SituatedContextResult":
     """
     Enrich a list of Document chunks by prepending a situated context sentence.
@@ -144,6 +212,8 @@ async def enrich_chunks_with_situated_context(
         llm: Async-capable LangChain LLM instance.
         doc_context: Brief overview of the document. Defaults to first ~800 chars of content.
         max_concurrent: Max concurrent LLM calls to avoid rate limits.
+        custom_prompt: Optional custom prompt to override defaults.
+        profile: Optional profile name to load prompt from YAML.
 
     Returns:
         SituatedContextResult with enriched documents and cumulative token_usage.
@@ -155,7 +225,7 @@ async def enrich_chunks_with_situated_context(
         # For table chunks the first chars are pipe-delimited markdown — useless as
         # document context.  Fall back to the source URL when available.
         first_doc_meta = documents[0].metadata if documents else {}
-        if first_doc_meta.get("element_type") in _TABLE_ELEMENT_TYPES:
+        if first_doc_meta.get("element_type") in _TABLE_ELEMENT_TYPES or first_doc_meta.get("type") in _TABLE_ELEMENT_TYPES:
             doc_context = first_doc_meta.get("source", "") or ""
         else:
             combined = " ".join(d.page_content[:150] for d in documents[:8])
@@ -166,7 +236,12 @@ async def enrich_chunks_with_situated_context(
     async def _enrich_one(doc: Document) -> tuple[Document, dict]:
         async with semaphore:
             ctx, usage = await _generate_situated_context(
-                doc_context, doc.page_content, llm, chunk_metadata=doc.metadata
+                doc_context, 
+                doc.page_content, 
+                llm, 
+                chunk_metadata=doc.metadata,
+                custom_prompt=custom_prompt,
+                profile=profile
             )
             if ctx:
                 doc.page_content = f"{ctx}\n\n{doc.page_content}"
@@ -183,7 +258,7 @@ async def enrich_chunks_with_situated_context(
         total_usage["output_tokens"] += usage["output_tokens"]
         total_usage["total_tokens"] += usage["total_tokens"]
 
-    return SituatedContextResult(documents=enriched_docs, token_usage=total_usage)
+    return SituatedContextResult(documents=enriched_docs, total_usage=total_usage)
 
 
 async def build_llm_from_config(config: "SituatedContextConfig", fallback_api_key: Optional[str] = None) -> Optional[object]:

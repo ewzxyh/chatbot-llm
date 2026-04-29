@@ -7,6 +7,122 @@
 
 
 ---
+## [2026-04-27]
+### 0.10.1-rc14 (feat: RAPTOR performance optimizations)
+
+Performance improvements across the entire RAPTOR hierarchical summarization pipeline, addressing the main throughput bottlenecks.
+
+#### `tilellm/modules/raptor/services/raptor_service.py`
+- **Parallelized LLM summary generation.** The per-cluster summary loop now uses `asyncio.gather()`, running all LLM calls for a level concurrently instead of sequentially. This reduces wall-clock time roughly proportional to the number of clusters per level.
+- **Batched vector store writes.** Leaf-node indexing and summary-node indexing both previously issued one `aadd_documents([doc])` call per node. Each call now collects all documents first and issues a single `aadd_documents(all_docs)` call per phase, eliminating round-trip overhead.
+- **UMAP+GMM offloaded to thread pool.** `RAPTORClustering.perform_clustering` is now wrapped in `asyncio.to_thread()`, preventing the CPU-bound UMAP dimensionality reduction and GMM fitting from blocking the event loop.
+
+#### `tilellm/modules/raptor/utils/clustering.py`
+- **Eliminated O(n²) float comparison in `perform_clustering`.** The previous implementation used `np.allclose` in a nested loop (`find_matching_indices`) to map local-cluster embeddings back to their original indices. The rewritten code tracks array indices directly through UMAP slicing operations, reducing complexity from O(n²·d) to O(n).
+- **BIC early stopping in `get_optimal_clusters`.** GMM fitting previously tried all values from 1 to `max_clusters` (default: 50) unconditionally. The function now stops after 3 consecutive iterations without improvement, reducing the average number of fits from 50 to a fraction of that on typical RAPTOR inputs.
+
+#### `tilellm/modules/raptor/repository/raptor_repository.py`
+- **Added `batch_index_nodes`.** New method that builds all `Document` objects from a node list and delegates to a single `aadd_documents` call, used by `RaptorService` instead of looping `index_summary_embedding`.
+- **Pipeline Redis deletes in `delete_tree`.** Node key deletions now execute in a single pipelined round-trip instead of one `await redis.delete()` per node.
+- **MGET in `list_trees` and `get_tree_by_doc_id`.** Both methods previously fetched tree metadata with N individual `GET` calls after `scan_iter`. They now issue a single `MGET` for all scanned keys.
+
+#### `tilellm/modules/raptor/controllers.py`
+- **Parallelized `/summarize` endpoint.** The per-group LLM summarization loop in `_summarize_logic` now uses `asyncio.gather()`.
+
+---
+## [2026-04-26]
+### 0.10.1-rc13 (feat: FalkorDB graph robustness, clustering fixes, entity deduplication, graph optimization)
+
+A comprehensive set of fixes and improvements for the FalkorDB Knowledge Graph pipeline, addressing data loss during concurrent execution, incorrect clustering due to FalkorDB's internal result cap, LLM context-window saturation, and entity duplication across extraction runs.
+
+#### Graph creation robustness
+
+- **Fixed: node deletion during concurrent runs.**
+  Two TaskIQ workers picking up the same graph-creation task would delete each other's work via the `delete_nodes_by_metadata` call at the start of a new run. Three complementary fixes:
+  1. **Redis distributed lock** on `create_community_graph` prevents a second worker from entering the creation flow while one is already running. Lock key: `graph_lock:{graph_name}`, TTL controlled by `GRAPH_LOCK_TTL_SECONDS` (default: 86400 s / 24 h).
+  2. **`retry_on_error=False`** on `task_falkor_graph_create`: TaskIQ's retry-on-error mechanism re-submitted the task with `overwrite=True`, which caused the wipe+restart cycle on transient failures. Auto-retry is now disabled; failures must be re-submitted explicitly.
+  3. **Fixed `LIMIT 10000` bug** in `delete_nodes_by_metadata` (`async_falkor_repository.py` and `falkor_repository.py`): the deletion query ran only once, leaving nodes beyond the first 10 000 untouched. It now loops in batches until FalkorDB reports 0 deleted rows.
+
+- **Added: MinIO checkpoint / resume for graph extraction.**
+  If the TaskIQ worker is killed mid-extraction, the next run with `overwrite=False` resumes from the last completed window instead of restarting from scratch.
+  - `MinIOStorageService.save_checkpoint(graph_name, window_idx, entity_node_map_delta, chunk_ids)` — saves a per-window Parquet file to `checkpoints/{graph_name}/window_{n:06d}.parquet`.
+  - `MinIOStorageService.load_checkpoints(graph_name)` — aggregates all checkpoint files and returns `(entity_node_map, processed_chunk_ids, last_window_idx)`.
+  - `MinIOStorageService.delete_checkpoints(graph_name)` — cleans up checkpoint files after a successful run.
+  - `import_from_vector_store`: on `overwrite=False`, loads checkpoints to restore `entity_node_map` and skip already-processed chunks; saves a checkpoint after each window; deletes all checkpoints on completion.
+
+#### Clustering robustness
+
+- **Fixed: Redis lock on community report generation.**
+  `generate_hierarchical_reports` is now protected by the same Redis lock (`graph_lock:{graph_name}`) used for graph creation, preventing concurrent clustering workers from triggering redundant cleanup and report deletion.
+
+- **Fixed: `retry_on_error=False`** on all three FalkorDB clustering tasks: `task_falkor_louvain_cluster`, `task_falkor_leiden_cluster`, `task_falkor_hierarchical_cluster`. Prevents destructive re-runs on transient failures.
+
+- **Fixed: FalkorDB `Query timed out` during clustering on large graphs.**
+  The single `OPTIONAL MATCH` query for fetching the full graph caused a timeout on graphs with 30 000+ nodes (connection-level default: 1 s).
+  - `_execute_query` now accepts an optional `timeout` parameter (ms), passed directly to `graph.query(..., timeout=timeout)`.
+  - `get_all_nodes_and_relationships` rewritten as two separate queries (nodes then relationships, excluding `CommunityReport` nodes) with `query_timeout=300000` (5 minutes).
+
+- **Fixed: FalkorDB `resultset_size=10000` cap truncating clustering input.**
+  FalkorDB silently caps query results at 10 000 rows. On a 33 000-node graph both queries returned exactly 10 000 rows, causing Leiden to cluster a partial graph and produce 2 600+ spurious communities.
+  Both queries in `get_all_nodes_and_relationships` now paginate with `SKIP $skip LIMIT 5000`, looping until the last page is shorter than the page size.
+
+- **Added: configurable Leiden resolution and minimum community size.**
+  `GraphClusterRequest` now exposes:
+  - `resolutions: Optional[List[float]]` — per-level resolution `[L0, L1, L2]`. Defaults to `[0.05, 0.15, 0.35]` (lowered from the previous hardcoded `[1.2, 0.8, 0.5]`), producing fewer and larger communities on sparse graphs.
+  - `min_community_size: int` (default: 8) — communities below this threshold are discarded without generating a report.
+
+- **Fixed: LLM context-window saturation during community report generation.**
+  `_generate_community_report_igraph` now caps prompt content via `max_prompt_chars` (default: 18 000 chars ≈ 4 500 tokens). Entity descriptions are truncated to 200 characters each; entities get 2/3 of the budget and relationships 1/3; excess items are replaced by a `[... N more not shown]` marker.
+  `GraphClusterRequest` exposes `max_community_prompt_chars: int` (default: 18 000) so callers can tune it per-request for smaller-context models.
+
+#### Entity deduplication (Level 1 + Level 2)
+
+Root cause of graph sparsity: each extraction run created new nodes for every entity, even if an identical or near-identical node already existed in the graph, inflating node counts, breaking connectivity, and causing Leiden to detect thousands of isolated communities.
+
+- **Level 1 — Name normalization.**
+  Added `AsyncFalkorGraphRepository._normalize_name(name)` → `name.strip().lower()`. All `entity_node_map` keys are now normalized, so "ASL Bari", "asl bari", and " ASL Bari " resolve to the same node. Applied in `batch_create_nodes` (UNWIND path and individual-create fallback) and `batch_create_relationships` (source/target lookup).
+
+- **Level 2 — Pre-load existing nodes before extraction.**
+  Added `AsyncFalkorGraphRepository.load_entity_name_map(namespace, graph_name)` — paginates the graph in batches of 5 000, returning `normalized_name → node_id` for all existing non-`CommunityReport` nodes.
+  In `import_from_vector_store`, when `overwrite=False`, the entity map is pre-populated from the graph before the window loop. Checkpoint data (if present) is merged on top as the more recent source of truth.
+
+- **Deduplication during window loop.**
+  `batch_create_nodes` now accepts `existing_entity_node_map`. Entities whose normalized name already appears in it are skipped (no `CREATE` issued) and their existing `node_id` is returned directly. Callers pass the current `entity_node_map` on every window, so entities seen in window 1 are not re-created in window 400.
+
+#### Graph optimization and reimport
+
+- **Added: `POST /api/kg-falkor/optimize` — embedding-based entity deduplication.**
+  New `GraphOptimizer` service (`services/graph_optimizer.py`) runs the full pipeline as an async TaskIQ task:
+  1. Export the full graph from FalkorDB → Parquet bytes.
+  2. Batch-embed all entity `name: description` strings via the configured LLM embedder (optimised for TEI/vLLM).
+  3. Find near-duplicate pairs with **SimSIMD** `cdist` (cosine, chunked at 2 000 rows to cap peak memory) + Union-Find transitive grouping.
+  4. Build the merge plan with **DuckDB** (used as in-memory SQL engine via pandas bridge): canonical nodes get unioned `source_ids` (vector store references preserved), relationships are redirected and deduplicated.
+  5. Save the optimised snapshot to MinIO (`graph_snapshots/{graph_name}/{timestamp}/`).
+  6. Wipe FalkorDB and reimport from the optimised snapshot. Community reports are restored from MinIO as-is — no re-clustering required.
+  - `dry_run=true` returns the merge plan stats without touching FalkorDB.
+  - `similarity_threshold` (default 0.92) and `embedding_batch_size` (default 256) are API parameters.
+
+- **Added: `POST /api/kg-falkor/reimport` — restore graph from MinIO snapshot.**
+  Wipes FalkorDB and reimports nodes + relationships from any saved snapshot (latest by default, or a specific `snapshot_timestamp`). Community reports optionally restored from MinIO. Useful for rollback after a failed optimization, version management, or disaster recovery.
+
+- **Added: Community reports persisted to MinIO Parquet per Leiden level.**
+  After each Leiden level in `_generate_hierarchical_reports_locked`, community reports are saved to `community_reports/{graph_name}/level_{n:02d}.parquet` via `MinIOStorageService.save_community_reports`. This makes reports available for the reimport pipeline without re-clustering.
+
+- **Added: MinIO graph snapshot API** (`save_graph_snapshot`, `load_graph_snapshot`, `list_graph_snapshots`) in `MinIOStorageService`.
+  Path: `graph_snapshots/{graph_name}/{timestamp}/nodes.parquet` and `.../relationships.parquet`.
+
+- **New schemas**: `GraphOptimizeRequest`, `GraphOptimizeResponse`, `GraphReimportRequest`, `GraphReimportResponse`.
+- **New TaskIQ tasks**: `task_falkor_optimize_graph`, `task_falkor_reimport_graph` (both `retry_on_error=False`).
+
+---
+## [2026-04-25]
+### 0.10.1-rc12
+- Added: **Situated Context Profiles** support. Prompts for Contextual Retrieval can now be stored as YAML files in `tilellm/shared/profiles/situated_context/`.
+- Added: New `determina.yaml` profile optimized for administrative acts, helping Knowledge Graph extraction by anchoring facts to dates and document IDs.
+- Improved: Global support for `profile` and `custom_prompt` in `SituatedContextConfig` across all ingestion pipelines (PDF OCR, DOCX) and repositories (Qdrant, Pinecone, Milvus).
+- Fixed: Double description noise in PDF OCR. The system now intelligently skips redundant situated context LLM calls for tables and images that already have semantic descriptions.
+- Fixed: `TypeError` in `top_p_range` validator in `tilellm/models/llm.py` when `top_p` is None.
+
 ## [2026-04-24]
 ### 0.10.1-rc11
 - Fixed: Semantic cache validation error in `POST /api/qa` where `RetrievalResult` failed due to missing required `namespace` field.

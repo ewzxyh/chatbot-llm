@@ -990,6 +990,8 @@ The Knowledge Graph module provides advanced graph-based retrieval using FalkorD
 - `POST /api/kg-falkor/leiden-cluster` - Perform Leiden clustering (async)
 - `POST /api/kg-falkor/hierarchical` - Perform Hierarchical Clustering (async)
 - `POST /api/kg-falkor/community-analysis` - Perform community analysis (async)
+- `POST /api/kg-falkor/optimize` - Deduplicate entity nodes via embedding similarity + DuckDB merge (async)
+- `POST /api/kg-falkor/reimport` - Reimport graph from a MinIO Parquet snapshot (async)
 
 ### Search & QA
 - `POST /api/kg-falkor/qa` - Community/Global search on community reports
@@ -998,6 +1000,150 @@ The Knowledge Graph module provides advanced graph-based retrieval using FalkorD
 - `POST /api/kg-falkor/agenticqa` - Agentic QA with iterative reasoning and tool usage
 - `GET /api/kg-falkor/network` - Get network visualization data (nodes and relationships)
 - `POST /api/kg-falkor/multimodal-search` - Multimodal search combining text and image embeddings
+
+---
+
+### `POST /api/kg-falkor/optimize`
+
+Deduplicates entity nodes in a FalkorDB graph using embedding-based cosine similarity (SimSIMD) and a DuckDB merge plan. Near-duplicate entities are merged into a single canonical node; their `source_ids` (vector store references) are unioned, and all relationships are redirected. The optimised graph is saved as a Parquet snapshot on MinIO and then reimported into FalkorDB. Community reports are preserved without re-clustering.
+
+> Runs as an async TaskIQ task when `ENABLE_TASKIQ=true`. Use `GET /api/kg-falkor/tasks/{task_id}` to poll status.
+
+**Request body**
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `namespace` | string | required | Graph namespace |
+| `engine` | Engine | required | Vector store configuration |
+| `graph_db_name` | string | auto | FalkorDB graph name (computed from namespace + creation_prompt if not provided) |
+| `creation_prompt` | string | `"generic"` | Must match the value used in `/create` |
+| `similarity_threshold` | float | `0.92` | Cosine similarity above which two entities are merged. Range: 0.5–1.0. Recommended: 0.90–0.95. |
+| `embedding_batch_size` | int | `256` | Entities embedded per LLM call. Raise for TEI/vLLM, lower for cloud APIs. |
+| `dry_run` | bool | `false` | If `true`, computes and returns the merge plan without touching FalkorDB. |
+| `webhook_url` | string | null | Called on task completion with the result payload. |
+| `llm_key`, `llm`, `model` | string | — | LLM credentials and model (inherited from `QuestionAnswer`). |
+
+**Example request**
+
+```json
+{
+  "namespace": "asl-bari",
+  "creation_prompt": "medical",
+  "engine": {
+    "name": "qdrant",
+    "deployment": "local",
+    "index_name": "asl-bari-index",
+    "vector_size": 768
+  },
+  "similarity_threshold": 0.92,
+  "embedding_batch_size": 256,
+  "dry_run": false,
+  "llm": "openai",
+  "model": "text-embedding-3-small"
+}
+```
+
+**Response (synchronous)**
+
+```json
+{
+  "status": "success",
+  "nodes_before": 33427,
+  "nodes_after": 21083,
+  "nodes_merged": 12344,
+  "relationships_before": 41210,
+  "relationships_after": 38965,
+  "merge_pairs": 12344,
+  "dry_run": false,
+  "snapshot_timestamp": "20260426_152300"
+}
+```
+
+**Response (dry_run=true)**
+
+```json
+{
+  "status": "dry_run",
+  "nodes_before": 33427,
+  "nodes_after": 21083,
+  "nodes_merged": 12344,
+  "relationships_before": 41210,
+  "relationships_after": 41210,
+  "merge_pairs": 12344,
+  "dry_run": true
+}
+```
+
+---
+
+### `POST /api/kg-falkor/reimport`
+
+Wipes the current FalkorDB graph and reimports nodes + relationships from a previously saved MinIO Parquet snapshot. Useful for restoring after an optimize pass, reverting to an earlier version, or disaster recovery. Community reports stored in MinIO are optionally re-imported into FalkorDB.
+
+> Runs as an async TaskIQ task when `ENABLE_TASKIQ=true`.
+
+**Request body**
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `namespace` | string | required | Graph namespace |
+| `engine` | Engine | required | Vector store configuration |
+| `graph_db_name` | string | auto | FalkorDB graph name |
+| `creation_prompt` | string | `"generic"` | Must match the original creation_prompt |
+| `snapshot_timestamp` | string | null | Timestamp of the snapshot to restore (e.g. `"20260426_143000"`). If null, uses the most recent snapshot. |
+| `preserve_community_reports` | bool | `true` | If `true`, community reports saved in MinIO are re-imported into FalkorDB. |
+| `webhook_url` | string | null | Called on completion. |
+
+**Example request**
+
+```json
+{
+  "namespace": "asl-bari",
+  "creation_prompt": "medical",
+  "engine": {
+    "name": "qdrant",
+    "deployment": "local",
+    "index_name": "asl-bari-index",
+    "vector_size": 768
+  },
+  "snapshot_timestamp": "20260426_143000",
+  "preserve_community_reports": true
+}
+```
+
+**Response**
+
+```json
+{
+  "status": "success",
+  "nodes_imported": 21083,
+  "relationships_imported": 38965,
+  "community_reports_restored": 148,
+  "snapshot_timestamp": "20260426_143000"
+}
+```
+
+---
+
+### MinIO Snapshot Storage Layout
+
+The graph optimization pipeline uses the following MinIO bucket structure (bucket: `graphrag`):
+
+```
+graphrag/
+├── checkpoints/{graph_name}/
+│   └── window_{n:06d}.parquet      # Per-window extraction checkpoints (deleted on success)
+├── community_reports/{graph_name}/
+│   └── level_{n:02d}.parquet       # Community reports per Leiden level (saved after each clustering run)
+└── graph_snapshots/{graph_name}/
+    └── {timestamp}/
+        ├── nodes.parquet            # All entity nodes (before or after optimization)
+        └── relationships.parquet    # All relationships (before or after optimization)
+```
+
+Snapshots are created automatically by `/optimize` (before and after the merge). They can also be created manually or used as the source for `/reimport`.
+
+---
 
 For detailed request/response schemas and examples, refer to the [Knowledge Graph FalkorDB README](tilellm/modules/knowledge_graph_falkor/README.md).
 

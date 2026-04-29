@@ -68,6 +68,11 @@ class CachedVectorStore:
         sull'event loop corretto e che la collection esista.
         """
         cur_loop = asyncio.get_running_loop()
+        # Fast path: skip lock acquisition when already fully initialised on the
+        # current event loop.  Safe in asyncio (single-threaded) because there
+        # are no await points between the read and the return.
+        if self._collection_ready and self._qdrant_client is not None and self._loop is cur_loop:
+            return
         async with self._lock:
             # Se il client non esiste o l'event loop è cambiato, lo ricreiamo
             if self._qdrant_client is None or self._loop is not cur_loop:
@@ -716,7 +721,12 @@ class QdrantRepository(VectorStoreRepository):
                     from tilellm.shared.situated_context import enrich_chunks_with_situated_context, build_llm_from_item
                     situated_llm = await build_llm_from_item(item)
                     if situated_llm:
-                        sc_result = await enrich_chunks_with_situated_context(chunks, situated_llm)
+                        sc_result = await enrich_chunks_with_situated_context(
+                            chunks, 
+                            situated_llm,
+                            profile=item.situated_context.profile,
+                            custom_prompt=item.situated_context.custom_prompt
+                        )
                         chunks = sc_result.documents
                         sc_token_usage = sc_result.token_usage
                         logger.info(f"Situated context applied to {len(chunks)} chunks. Tokens: {sc_token_usage}")
@@ -879,7 +889,12 @@ class QdrantRepository(VectorStoreRepository):
                     from tilellm.shared.situated_context import enrich_chunks_with_situated_context, build_llm_from_item
                     situated_llm = await build_llm_from_item(item)
                     if situated_llm:
-                        sc_result = await enrich_chunks_with_situated_context(chunks, situated_llm)
+                        sc_result = await enrich_chunks_with_situated_context(
+                            chunks, 
+                            situated_llm,
+                            profile=item.situated_context.profile,
+                            custom_prompt=item.situated_context.custom_prompt
+                        )
                         chunks = sc_result.documents
                         sc_token_usage = sc_result.token_usage
                         logger.info(f"Situated context applied to {len(chunks)} chunks. Tokens: {sc_token_usage}")

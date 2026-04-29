@@ -27,8 +27,11 @@ redis_url = os.environ.get("REDIS_URL", redis_url)
 # TTL per i risultati: 48h
 RESULT_TTL_SECONDS = int(os.environ.get("TASKIQ_RESULT_TTL", str(48 * 60 * 60)))
 
-# Idle timeout PEL: dopo quanti ms un messaggio non-ACK viene reclamato (default 5 min)
-IDLE_TIMEOUT_MS = int(os.environ.get("TASKIQ_IDLE_TIMEOUT_MS", "300000"))
+# Idle timeout PEL: dopo quanti ms un messaggio non-ACK viene reclamato dal loop periodico.
+# DEVE essere > durata massima di un singolo task (PDF Docling può durare 30+ min).
+# Se troppo basso, xautoclaim ri-dispatcha task ancora in esecuzione → OOM → crash.
+# Il crash-recovery rapido è gestito dallo startup-reclaim nel WORKER_STARTUP handler.
+IDLE_TIMEOUT_MS = int(os.environ.get("TASKIQ_IDLE_TIMEOUT_MS", "3600000"))  # 60 min
 
 # --- 2. Resilient Backend Configuration ---
 result_backend = RedisAsyncResultBackend(
@@ -67,9 +70,76 @@ async def startup(state: TaskiqState) -> None:
         redis_health_client = await from_url(redis_url, password=redis_password)
         await redis_health_client.ping()
         logger.info("✅ Redis connection OK")
+
+        # Startup reclaim: rivendica immediatamente i messaggi in PEL lasciati da un
+        # worker precedente crashato. Il loop periodico usa idle_timeout (60 min) per
+        # evitare di reclamare task ancora in esecuzione, ma al restart è sicuro
+        # reclamare tutto perché il processo precedente è già morto.
+        # min_idle_time=1000ms (1s) evita race condition con dispatch appena arrivati.
+        await _startup_reclaim(redis_health_client)
+
     except Exception as e:
         logger.error(f"❌ Redis connection FAILED: {e}")
         raise
+
+
+async def _startup_reclaim(redis_client) -> None:
+    """Re-queue PEL messages from dead workers as fresh stream entries.
+
+    XAUTOCLAIM alone only transfers ownership inside the PEL; the broker's main
+    loop uses XREADGROUP with '>' which reads only *undelivered* messages, never
+    the PEL. Messages left in the PEL would wait idle_timeout (60 min) before
+    the periodic autoclaim re-dispatches them.
+
+    Strategy: claim each pending message, XADD it back to the stream as a brand-new
+    entry (the normal broker format: {b"data": <payload>}), then XACK the old entry
+    to clean up the PEL. The broker's '>' loop will pick up the new entries
+    immediately on the next xreadgroup call.
+    """
+    try:
+        stream_name = broker.queue_name          # default "taskiq"
+        group_name = broker.consumer_group_name  # default "taskiq"
+        consumer_name = broker.consumer_name     # UUID of this new worker
+
+        total_requeued = 0
+        start_id = "0-0"
+
+        while True:
+            result = await redis_client.xautoclaim(
+                name=stream_name,
+                groupname=group_name,
+                consumername=consumer_name,
+                min_idle_time=1000,  # 1 s — skip brand-new messages (race at startup)
+                start_id=start_id,
+                count=100,
+            )
+            # result = (next_start_id, [(msg_id, {b"data": payload}), ...], deleted_ids)
+            claimed = result[1] if len(result) > 1 else []
+
+            for msg_id, msg_data in claimed:
+                payload = msg_data.get(b"data")
+                if payload is None:
+                    # unknown format — just ack to avoid permanent PEL pollution
+                    await redis_client.xack(stream_name, group_name, msg_id)
+                    continue
+                # Re-publish as new undelivered message; broker '>' loop picks it up
+                await redis_client.xadd(stream_name, {b"data": payload})
+                # Clean up the old PEL entry
+                await redis_client.xack(stream_name, group_name, msg_id)
+                total_requeued += 1
+
+            next_id = result[0] if result else b"0-0"
+            if not claimed or next_id in (b"0-0", "0-0"):
+                break
+            start_id = next_id
+
+        if total_requeued:
+            logger.info(f"♻️ Startup reclaim: {total_requeued} messaggi re-pubblicati nello stream (pronti per il consumer)")
+        else:
+            logger.info("✅ Nessun messaggio PEL da reclamare all'avvio")
+
+    except Exception as e:
+        logger.warning(f"Startup reclaim non riuscito (non critico): {e}")
 
 @broker.on_event(TaskiqEvents.WORKER_SHUTDOWN)
 async def shutdown(state: TaskiqState) -> None:

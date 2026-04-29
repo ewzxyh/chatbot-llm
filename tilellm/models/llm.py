@@ -28,6 +28,8 @@ class SituatedContextConfig(BaseModel):
     url: Optional[str] = Field(default=None, description="Custom endpoint URL (for vLLM / Ollama local deployments)")
     temperature: float = Field(default=0.0)
     max_tokens: int = Field(default=256)
+    profile: Optional[str] = Field(default=None, description="Name of a predefined situated context profile (YAML file in shared/profiles/situated_context/)")
+    custom_prompt: Optional[str] = Field(default=None, description="Override the default situating prompt with a custom one. Use {doc_context} and {chunk_text} placeholders.")
 
 
 class TableOptions(BaseModel):
@@ -180,6 +182,11 @@ class QuestionAnswer(BaseModel):
     retrieval_query: Optional[str] = Field(default=None, description="Override query for retrieval embedding only (used by HyDE and future Self-RAG)")
     use_raptor: bool = Field(default=False, description="Enable RAPTOR (hierarchical tree-based retrieval) instead of standard RAG")
     use_cache: bool = Field(default=False, description="Enable semantic cache for this query (L1 exact + L2 cosine similarity)")
+    precomputed_query_embedding: Optional[List[float]] = Field(
+        default=None,
+        exclude=True,
+        description="Internal: dense embedding already computed (e.g. during cache lookup). Skips redundant aembed_query call."
+    )
 
     #@field_validator("temperature")
     #def temperature_range(cls, v):
@@ -274,9 +281,9 @@ class QuestionAnswer(BaseModel):
 
     @field_validator("top_p")
     def top_p_range(cls, v):
-        """Ensures temperature is within valid range (usually 0.0 to 1.0)."""
-        if not 0.0 <= v <= 1.0:
-            raise ValueError("Temperature must be between 0.0 and 1.0.")
+        """Ensures top_p is within valid range (usually 0.0 to 1.0) if provided."""
+        if v is not None and not 0.0 <= v <= 1.0:
+            raise ValueError("top_p must be between 0.0 and 1.0.")
         return v
 
     @field_validator("top_k")
@@ -460,9 +467,9 @@ class QuestionToLLM(BaseModel):
 
     @field_validator("top_p")
     def top_p_range(cls, v):
-        """Ensures temperature is within valid range (usually 0.0 to 1.0)."""
-        if not 0.0 <= v <= 1.0:
-            raise ValueError("Temperature must be between 0.0 and 1.0.")
+        """Ensures top_p is within valid range (usually 0.0 to 1.0) if provided."""
+        if v is not None and not 0.0 <= v <= 1.0:
+            raise ValueError("top_p must be between 0.0 and 1.0.")
         return v
 
     def create_mcp_client(self):

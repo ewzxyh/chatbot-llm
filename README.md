@@ -392,12 +392,14 @@ This starts:
 
 #### GraphRAG Workflow with FalkorDB
 
-1. **Ingestion**: Documents → Vector Store → GraphRAG extraction
-2. **Graph Construction**: Entities & relationships → FalkorDB graph
-3. **Community Detection**: Leiden clustering (3 hierarchical levels)
-4. **Report Generation**: LLM-based community reports with synthetic QA
+1. **Ingestion**: Documents → Vector Store → GraphRAG extraction (windowed, resumable via MinIO checkpoints)
+2. **Graph Construction**: Entities & relationships → FalkorDB (normalized deduplication across windows and runs)
+3. **Community Detection**: Leiden clustering (3 hierarchical levels, configurable resolution and min size)
+4. **Report Generation**: LLM-based community reports with synthetic QA, saved to MinIO Parquet per level
 5. **Vector Indexing**: Reports embedded and indexed for semantic search
 6. **Query Time**: Context fusion (global + local + graph expansion)
+7. **Optimization** *(optional)*: Embedding-based entity deduplication via SimSIMD + DuckDB merge plan
+8. **Reimport** *(optional)*: Restore graph from any MinIO snapshot for rollback or disaster recovery
 
 See [FalkorDB GraphRAG Documentation](tilellm/modules/knowledge_graph_falkor/README.md) for detailed API usage and examples.
 
@@ -421,17 +423,22 @@ Tiledesk LLM now features a modular architecture that allows you to enable or di
 - **Automatic community report updates**: Community reports are automatically regenerated after document addition
 - **Sparse encoder support**: Full support for hybrid search with SPLADE and BGE-M3 sparse encoders
 
-**FalkorDB Implementation (NEW - Production Ready):**
+**FalkorDB Implementation (Production Ready):**
 - **FalkorDB Integration**: Redis-based graph database with native graph operations, async/await implementation
-- **Hierarchical Leiden Clustering**: Multi-level community detection (3 levels: fine/medium/coarse) with configurable resolution
+- **Hierarchical Leiden Clustering**: Multi-level community detection (3 levels: fine/medium/coarse) with configurable `resolutions` and `min_community_size`
+- **Resumable Extraction**: MinIO checkpoint/resume — interrupted runs restart from the last completed window (`overwrite=false`)
+- **Entity Deduplication**: Name normalization (Level 1) + pre-load existing nodes before each run (Level 2) prevent duplicate nodes across windows and runs
+- **Graph Optimization**: `POST /api/kg-falkor/optimize` — embedding-based deduplication via SimSIMD cosine similarity and DuckDB merge plan, with `dry_run` support
+- **Graph Reimport**: `POST /api/kg-falkor/reimport` — restore any snapshot from MinIO for rollback or disaster recovery
+- **MinIO Parquet Persistence**: Nodes, relationships, and community reports (per Leiden level) all persisted to MinIO for audit, recovery, and optimization
 - **Adaptive Graph Expansion**: Query-type aware expansion (technical: 1-hop, exploratory: 2-hop, relational: 3-hop)
 - **Synthetic QA Generation**: Automatic question generation for community reports with context enhancement
 - **Cross-Encoder Reranking**: Advanced relevance scoring with TEI and Pinecone Inference API support
 - **Context Fusion Search**: Ultimate hybrid method combining global (community), local (vector+keyword), and graph expansion
 - **RRF (Reciprocal Rank Fusion)**: Intelligent fusion of dense and sparse retrieval results
-- **Cleanup Management**: Automatic cleanup of stale community reports before regeneration (prevents duplicates)
 - **Multi-Tenancy**: Namespace-per-graph isolation for secure multi-user environments
 - **Query Type Detection**: LLM-based detection (exploratory/technical/relational) with adaptive weight adjustment
+- **Concurrency Safety**: Redis distributed lock (`graph_lock:{graph_name}`) prevents concurrent workers from corrupting graph creation or clustering
 
 **Architecture Features:**
 - **Async-first**: Fully async/await implementation with connection pooling

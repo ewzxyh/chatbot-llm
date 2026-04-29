@@ -6,9 +6,6 @@ from io import BytesIO
 from enum import Enum
 from typing import Optional, Dict, Any
 
-# Silence noisy RapidOCR logs
-logging.getLogger("RapidOCR").setLevel(logging.ERROR)
-
 import pandas as pd
 from minio import Minio
 import duckdb
@@ -29,6 +26,25 @@ from tilellm.shared.utility import get_service_config
 from tilellm.modules.knowledge_graph.services.minio_storage import get_minio_storage_service
 
 logger = logging.getLogger(__name__)
+
+
+def _silence_ocr_loggers() -> None:
+    """Suppress RapidOCR empty-detection warnings.
+
+    RapidOCR resets its logger level to INFO inside DocumentConverter.__init__,
+    so silencing must happen after the converter is created.
+    We also remove the custom StreamHandler that RapidOCR adds (propagate=False)
+    to prevent duplicate output via the colorlog handler.
+    """
+    for name in (
+        "RapidOCR",
+        "docling.models.stages.ocr.rapid_ocr_model",
+    ):
+        log = logging.getLogger(name)
+        log.setLevel(logging.ERROR)
+        for h in list(log.handlers):
+            h.setLevel(logging.ERROR)
+
 
 class DocumentType(Enum):
     PDF = "pdf"
@@ -80,6 +96,12 @@ class ProductionDocumentProcessor:
                     InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
                 }
             )
+            # Silence noisy OCR loggers AFTER Docling init: RapidOCR resets its own
+            # logger level to INFO during DocumentConverter.__init__, so the silence
+            # must come after, not at module import time.
+            # "RapidOCR returned empty result!" and "text detection result is empty"
+            # are normal — they occur when Docling scans image regions without text.
+            _silence_ocr_loggers()
             logger.info("Docling initialized successfully.")
         except Exception as e:
             logger.error(f"Failed to initialize Docling: {e}")

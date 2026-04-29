@@ -31,11 +31,71 @@ from tilellm.shared.embedding_factory import inject_embedding
 from langchain_core.documents import Document
 
 
+import json
 import logging
 
 from tilellm.tools.sparse_encoders import TiledeskSparseEncoders
 
 logger = logging.getLogger(__name__)
+
+_PINECONE_METADATA_MAX_BYTES = 40960  # Pinecone hard limit: 40 KB per vector
+
+
+def _sanitize_metadata(metadata: dict, text_key: str = "text") -> dict:
+    """Enforce Pinecone's 40 KB per-vector metadata limit.
+
+    Steps (in order):
+    1. Drop `file_content` — never used for retrieval filtering.
+    2. Truncate/drop non-essential fields (surrounding_text, answerable_questions, …).
+    3. Last resort: truncate the chunk text itself so the vector is still indexed.
+    """
+    def _size(d: dict) -> int:
+        try:
+            return len(json.dumps(d, ensure_ascii=False).encode("utf-8"))
+        except (TypeError, ValueError):
+            return _PINECONE_METADATA_MAX_BYTES + 1
+
+    cleaned = {k: v for k, v in metadata.items() if k != "file_content"}
+
+    if _size(cleaned) <= _PINECONE_METADATA_MAX_BYTES:
+        return cleaned
+
+    # Step 2: truncate non-essential fields
+    non_essential = ["surrounding_text", "answerable_questions", "columns",
+                     "headings_context", "element_types"]
+    for key in non_essential:
+        val = cleaned.get(key)
+        if val is None:
+            continue
+        if isinstance(val, list):
+            cleaned.pop(key, None)
+        elif isinstance(val, str) and len(val) > 200:
+            cleaned[key] = val[:200] + "…"
+        if _size(cleaned) <= _PINECONE_METADATA_MAX_BYTES:
+            return cleaned
+
+    # Step 3: truncate the chunk text content itself
+    text_val = cleaned.get(text_key, "")
+    if isinstance(text_val, str):
+        meta_without_text = {k: v for k, v in cleaned.items() if k != text_key}
+        overhead = _size(meta_without_text)
+        # Reserve 64 bytes for JSON key+quotes+comma overhead
+        max_text_bytes = _PINECONE_METADATA_MAX_BYTES - overhead - 64
+        if max_text_bytes > 100:
+            truncated = text_val.encode("utf-8")[:max_text_bytes].decode("utf-8", errors="ignore")
+            cleaned[text_key] = truncated + "…"
+            logger.warning(
+                f"Chunk text truncated {len(text_val)} → {len(truncated)} chars "
+                f"to fit Pinecone 40 KB metadata limit."
+            )
+        else:
+            cleaned.pop(text_key, None)
+            logger.error(
+                f"Chunk text removed entirely — metadata overhead {overhead} B "
+                f"exceeds Pinecone 40 KB limit."
+            )
+
+    return cleaned
 
 
 class PineconeRepositoryServerless(PineconeRepositoryBase):
@@ -267,7 +327,12 @@ class PineconeRepositoryServerless(PineconeRepositoryBase):
                     from tilellm.shared.situated_context import enrich_chunks_with_situated_context, build_llm_from_item
                     situated_llm = await build_llm_from_item(item)
                     if situated_llm:
-                        sc_result = await enrich_chunks_with_situated_context(chunks, situated_llm)
+                        sc_result = await enrich_chunks_with_situated_context(
+                            chunks, 
+                            situated_llm,
+                            profile=item.situated_context.profile,
+                            custom_prompt=item.situated_context.custom_prompt
+                        )
                         chunks = sc_result.documents
                         sc_token_usage = sc_result.token_usage
                         logger.info(f"Situated context applied to {len(chunks)} chunks. Tokens: {sc_token_usage}")
@@ -409,7 +474,12 @@ class PineconeRepositoryServerless(PineconeRepositoryBase):
                     from tilellm.shared.situated_context import enrich_chunks_with_situated_context, build_llm_from_item
                     situated_llm = await build_llm_from_item(item)
                     if situated_llm:
-                        sc_result = await enrich_chunks_with_situated_context(chunks, situated_llm)
+                        sc_result = await enrich_chunks_with_situated_context(
+                            chunks, 
+                            situated_llm,
+                            profile=item.situated_context.profile,
+                            custom_prompt=item.situated_context.custom_prompt
+                        )
                         chunks = sc_result.documents
                         sc_token_usage = sc_result.token_usage
                         logger.info(f"Situated context applied to {len(chunks)} chunks. Tokens: {sc_token_usage}")
@@ -752,11 +822,14 @@ class PineconeRepositoryServerless(PineconeRepositoryBase):
                 # 4. Upsert to Pinecone
                 vectors_to_upsert = []
                 for j, content in enumerate(batch_contents):
-                    combined_metadata = {
-                        **batch_metadatas[j],
-                        engine.text_key: content,
-                        "namespace": namespace
-                    }
+                    combined_metadata = _sanitize_metadata(
+                        {
+                            **batch_metadatas[j],
+                            engine.text_key: content,
+                            "namespace": namespace,
+                        },
+                        text_key=engine.text_key,
+                    )
                     vector = {
                         "id": batch_ids[j],
                         "values": dense_embeds[j],

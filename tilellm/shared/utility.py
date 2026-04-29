@@ -1549,3 +1549,4 @@ def decode_jwt(token:str):
         raise ValueError("JWT_SECRET_KEY not configured")
     return jwt.decode(jwt=token, key=jwt_secret_key, algorithms=['HS256'])
 
+

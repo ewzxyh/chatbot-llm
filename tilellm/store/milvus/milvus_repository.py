@@ -486,7 +486,12 @@ class MilvusRepository(VectorStoreRepository):
                     from tilellm.shared.situated_context import enrich_chunks_with_situated_context, build_llm_from_item
                     situated_llm = await build_llm_from_item(item)
                     if situated_llm:
-                        sc_result = await enrich_chunks_with_situated_context(chunks, situated_llm)
+                        sc_result = await enrich_chunks_with_situated_context(
+                            chunks, 
+                            situated_llm,
+                            profile=item.situated_context.profile,
+                            custom_prompt=item.situated_context.custom_prompt
+                        )
                         chunks = sc_result.documents
                         sc_token_usage = sc_result.token_usage
                         logger.info(f"Situated context applied to {len(chunks)} chunks. Tokens: {sc_token_usage}")
@@ -643,7 +648,12 @@ class MilvusRepository(VectorStoreRepository):
                     from tilellm.shared.situated_context import enrich_chunks_with_situated_context, build_llm_from_item
                     situated_llm = await build_llm_from_item(item)
                     if situated_llm:
-                        sc_result = await enrich_chunks_with_situated_context(chunks, situated_llm)
+                        sc_result = await enrich_chunks_with_situated_context(
+                            chunks, 
+                            situated_llm,
+                            profile=item.situated_context.profile,
+                            custom_prompt=item.situated_context.custom_prompt
+                        )
                         chunks = sc_result.documents
                         sc_token_usage = sc_result.token_usage
                         logger.info(f"Situated context applied to {len(chunks)} chunks. Tokens: {sc_token_usage}")
