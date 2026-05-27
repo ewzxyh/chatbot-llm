@@ -6,6 +6,12 @@
 ### **Copyright**: Tiledesk SRL
 
 
+
+---
+## [2026-05-27]
+### 0.11.0-rc2 (fix: reranking logic to return full document context instead of single top chunk; feat: extended situated_context with DeepSeek support)
+
+
 ---
 ## [2026-05-19]
 ### 0.11.0-rc1 (feat: CacheConfig L1/L2/L4 granular control; feat: temporal_digest PA-ASL taxonomy + anomaly detection + LLM classifier + hierarchical rollup + community context; feat: lgraph community summaries dual storage FalkorDB + vector store)
